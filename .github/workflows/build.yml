@@ -91,6 +91,12 @@ jobs:
           find project_raw | head -50
 
           echo ""
+          echo "=== Membersihkan file/folder sampah (macOS/Windows) ==="
+          find project_raw -name "__MACOSX" -type d -exec rm -rf {} + 2>/dev/null || true
+          find project_raw -name ".DS_Store" -type f -delete 2>/dev/null || true
+          find project_raw -name "Thumbs.db" -type f -delete 2>/dev/null || true
+
+          echo ""
           echo "=== Mengunci Project Dir (Manut Mode) ==="
           
           SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
@@ -104,6 +110,10 @@ jobs:
 
           echo "✅ Project root langsung dikunci di: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+          echo ""
+          echo "=== Verifikasi isi PROJECT_DIR ==="
+          ls -la "$PROJECT_DIR"
 
       # =========================
       # JAVA
@@ -126,7 +136,6 @@ jobs:
 
       # ==========================================================
       # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
       # ==========================================================
       - name: Analyze Project Code
         working-directory: ${{ env.PROJECT_DIR }}
@@ -153,7 +162,6 @@ jobs:
 
       # ==========================================================
       # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
       # ==========================================================
       - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
@@ -186,6 +194,7 @@ jobs:
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
+          set -o pipefail
           echo "=== Building APK ==="
           echo "Mode: ${{ github.event.inputs.build_type }}"
 
@@ -234,8 +243,6 @@ jobs:
             echo "❌ BUILD GAGAL! Berikut ringkasan error-nya:"
             echo ""
             echo "[RESULT_BUILD_ERROR]"
-            # Ambil bagian paling relevan: baris yang mengandung kata kunci error,
-            # kalau tidak ketemu, tampilkan 80 baris terakhir log build.
             if grep -Ei "error|exception|failure|failed" build_report.txt > /dev/null 2>&1; then
               grep -Ei -B2 -A5 "error|exception|failure|failed" build_report.txt
             else
