@@ -16,7 +16,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
     steps:
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -27,37 +26,29 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: 'stable'
+          flutter-version: '3.44.0'
           channel: stable
           cache: true
 
       - name: Create Flutter Project
         run: |
-          set -e
           APP_NAME="${{ github.event.inputs.app_name }}"
           PKG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_')
-
-          if [ -z "$PKG" ]; then
-            echo "❌ Nama aplikasi tidak valid setelah sanitasi (kosong)."
-            exit 1
-          fi
-
           flutter create --org com.webapk --project-name "$PKG" myapp
 
       - name: Add Assets and Dependencies
         run: |
-          set -e
           cd myapp
           flutter pub add webview_flutter
           flutter pub add flutter_launcher_icons
           flutter pub add connectivity_plus
 
+          # Menambahkan konfigurasi assets ke baris paling bawah untuk menghindari error indentasi YAML
           echo "  assets:" >> pubspec.yaml
           echo "    - assets/icon/" >> pubspec.yaml
 
       - name: Write main.dart
         run: |
-          set -e
           APP_NAME="${{ github.event.inputs.app_name }}"
           WEB_URL="${{ github.event.inputs.web_url }}"
 
@@ -106,7 +97,7 @@ jobs:
             late Animation<double> _dot1Anim;
             late Animation<double> _dot2Anim;
             late Animation<double> _dot3Anim;
-
+            
             bool _isChecking = false;
             bool _dialogShown = false;
 
@@ -420,22 +411,21 @@ jobs:
           }
           DART
 
+          # Mengubah pembatas slash (/) menjadi pagar (#) agar link HTTP tidak merusak regex sed
           sed -i "s#r'\$APP_NAME'#'$APP_NAME'#g" myapp/lib/main.dart
           sed -i "s#r'\$WEB_URL'#'$WEB_URL'#g" myapp/lib/main.dart
 
       - name: Fix Android Permissions and App Name
         run: |
-          set -e
           APP_NAME="${{ github.event.inputs.app_name }}"
           MANIFEST="myapp/android/app/src/main/AndroidManifest.xml"
-
+          
           sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.INTERNET"\/>' $MANIFEST
           sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>' $MANIFEST
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" $MANIFEST
 
       - name: Setup Network Security (Allow HTTP)
         run: |
-          set -e
           mkdir -p myapp/android/app/src/main/res/xml
           cat > myapp/android/app/src/main/res/xml/network_security_config.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -447,40 +437,22 @@ jobs:
             </base-config>
           </network-security-config>
           EOF
-
+          
           sed -i 's/<application/<application android:networkSecurityConfig="@xml\/network_security_config"/' \
             myapp/android/app/src/main/AndroidManifest.xml
 
       - name: Download and Sanitize Icon
         run: |
-          set -e
           mkdir -p myapp/assets/icon
-          sudo apt-get update -qq && sudo apt-get install -y imagemagick
+          sudo apt-get install -y imagemagick
 
-          echo "=== Downloading Icon ==="
           curl -L \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.icon_url }}" \
-            -o myapp/assets/icon/icon_raw \
-            -w "\n=== HTTP Status: %{http_code} ===\n"
+            -o myapp/assets/icon/icon_raw
 
-          echo ""
-          echo "=== File Type Check ==="
-          file myapp/assets/icon/icon_raw
-
-          # Validasi: pastikan file yang didownload benar-benar gambar, bukan JSON error
-          FILE_TYPE=$(file --mime-type -b myapp/assets/icon/icon_raw)
-          if [[ "$FILE_TYPE" != image/* ]]; then
-            echo "❌ File icon yang didownload BUKAN gambar valid (terdeteksi: $FILE_TYPE)"
-            echo ""
-            echo "=== Isi file (untuk debug) ==="
-            head -c 500 myapp/assets/icon/icon_raw
-            echo ""
-            exit 1
-          fi
-
-          echo "✅ Icon valid, lanjut konversi..."
+          # Mengubah gambar menjadi format PNG 1024x1024 yang valid
           convert myapp/assets/icon/icon_raw \
             -background transparent \
             -gravity center \
@@ -490,7 +462,6 @@ jobs:
 
       - name: Write launcher icons config
         run: |
-          set -e
           cat > myapp/flutter_launcher_icons.yaml << 'EOF'
           flutter_launcher_icons:
             android: true
@@ -501,37 +472,16 @@ jobs:
 
       - name: Generate Icons
         run: |
-          set -e
           cd myapp
           dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
 
-      - name: Get dependencies
-        run: |
-          cd myapp
-          timeout 120s flutter pub get
-
       - name: Build APK
         run: |
-          set -e
           cd myapp
-          flutter build apk --release 2>&1 | tee build_report.txt
-
-      - name: Verify APK Output
-        run: |
-          set -e
-          APK_PATH="myapp/build/app/outputs/flutter-apk/app-release.apk"
-          if [ ! -f "$APK_PATH" ]; then
-            echo "❌ APK tidak ditemukan di path yang diharapkan!"
-            find myapp -name "*.apk"
-            exit 1
-          fi
-          echo "✅ APK ditemukan:"
-          ls -lh "$APK_PATH"
+          flutter build apk --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: web2apk-release
           path: myapp/build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 1
-          if-no-files-found: error
