@@ -106,27 +106,26 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
       # =========================
-      # JAVA
+      # JAVA 17 (WAJIB!)
       # =========================
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
       # =========================
-      # FLUTTER
+      # FLUTTER (UPGRADE KE 3.22.4)
       # =========================
       - name: Setup Flutter
         uses: subosito/flutter-action@main
         with:
-          flutter-version: "3.41.9"
+          flutter-version: "3.22.4"    # ← GANTI DARI 3.41.9 KE 3.22.4
           channel: "stable"
           cache: true
 
       # ==========================================================
       # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
       # ==========================================================
       - name: Analyze Project Code
         working-directory: ${{ env.PROJECT_DIR }}
@@ -153,7 +152,6 @@ jobs:
 
       # ==========================================================
       # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
       # ==========================================================
       - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
@@ -234,8 +232,6 @@ jobs:
             echo "❌ BUILD GAGAL! Berikut ringkasan error-nya:"
             echo ""
             echo "[RESULT_BUILD_ERROR]"
-            # Ambil bagian paling relevan: baris yang mengandung kata kunci error,
-            # kalau tidak ketemu, tampilkan 80 baris terakhir log build.
             if grep -Ei "error|exception|failure|failed" build_report.txt > /dev/null 2>&1; then
               grep -Ei -B2 -A5 "error|exception|failure|failed" build_report.txt
             else
