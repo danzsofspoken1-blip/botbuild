@@ -64,7 +64,6 @@ jobs:
           } | tee -a "$LOG"
 
           download_ok=0
-
           for i in 1 2 3 4; do
             echo "Download attempt $i (public)..." | tee -a "$LOG"
             if curl -L --fail --retry 2 --retry-delay 2 \
@@ -109,13 +108,11 @@ jobs:
 
           if [ "$download_ok" -ne 1 ]; then
             echo "ERROR: Gagal download ZIP dari URL yang diberikan (404/unauthorized)." | tee -a "$LOG"
-            echo "Pastikan bot sudah publish release (bukan draft/untagged) sebelum trigger workflow." | tee -a "$LOG"
             exit 1
           fi
 
           FILE_SIZE=$(stat -c%s "$ZIP_OUT" 2>/dev/null || echo 0)
           echo "Downloaded size: ${FILE_SIZE} bytes" | tee -a "$LOG"
-
           if [ "$FILE_SIZE" -lt 100 ]; then
             echo "ERROR: File ZIP kosong atau terlalu kecil." | tee -a "$LOG"
             exit 1
@@ -136,38 +133,88 @@ jobs:
             exit 1
           }
 
-          # Cari settings.gradle / settings.gradle.kts / build.gradle (root)
-          SETTINGS=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n 1)
-          ROOT_GRADLE=""
-
-          if [ -n "$SETTINGS" ]; then
-            PROJECT_DIR=$(dirname "$SETTINGS")
-          else
-            ROOT_GRADLE=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) | head -n 1)
-            if [ -z "$ROOT_GRADLE" ]; then
-              echo "ERROR: settings.gradle / build.gradle tidak ditemukan di dalam ZIP." | tee -a "$LOG"
-              echo "Struktur folder setelah extract:" | tee -a "$LOG"
-              find "$GITHUB_WORKSPACE/project" -maxdepth 3 -type d 2>/dev/null | head -50 | tee -a "$LOG"
-              find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) 2>/dev/null | head -20 | tee -a "$LOG"
-              exit 1
+          # Deteksi Flutter project (ada pubspec.yaml) — folder android/ adalah subproject
+          PUBSPEC=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f -name "pubspec.yaml" | head -n 1)
+          if [ -n "$PUBSPEC" ]; then
+            FLUTTER_ROOT=$(dirname "$PUBSPEC")
+            echo "WARNING: ZIP ini terlihat seperti project FLUTTER (ada pubspec.yaml)." | tee -a "$LOG"
+            echo "Native workflow akan build folder android/ saja. Untuk full Flutter APK, pilih Flutter Build." | tee -a "$LOG"
+            if [ -d "$FLUTTER_ROOT/android" ]; then
+              PROJECT_DIR="$FLUTTER_ROOT/android"
+            else
+              PROJECT_DIR=""
             fi
-            PROJECT_DIR=$(dirname "$ROOT_GRADLE")
+          else
+            PROJECT_DIR=""
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            SETTINGS=$(find "$GITHUB_WORKSPACE/project" -maxdepth 5 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n 1)
+            if [ -n "$SETTINGS" ]; then
+              PROJECT_DIR=$(dirname "$SETTINGS")
+            else
+              ROOT_GRADLE=$(find "$GITHUB_WORKSPACE/project" -maxdepth 5 -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) | head -n 1)
+              if [ -z "$ROOT_GRADLE" ]; then
+                echo "ERROR: settings.gradle / build.gradle tidak ditemukan di dalam ZIP." | tee -a "$LOG"
+                echo "Struktur folder:" | tee -a "$LOG"
+                find "$GITHUB_WORKSPACE/project" -maxdepth 3 -type d 2>/dev/null | head -50 | tee -a "$LOG"
+                exit 1
+              fi
+              PROJECT_DIR=$(dirname "$ROOT_GRADLE")
+            fi
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project root: $PROJECT_DIR" | tee -a "$LOG"
           ls -la "$PROJECT_DIR" | tee -a "$LOG"
 
-          # Pastikan ada gradlew atau generate wrapper
-          if [ ! -f "$PROJECT_DIR/gradlew" ]; then
-            echo "gradlew tidak ada, akan coba pakai gradle system / generate wrapper" | tee -a "$LOG"
-          else
+          # local.properties wajib untuk Android SDK path
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_DIR" > "$PROJECT_DIR/local.properties"
+          echo "Wrote local.properties -> sdk.dir=$SDK_DIR" | tee -a "$LOG"
+
+          if [ -f "$PROJECT_DIR/gradlew" ]; then
             chmod +x "$PROJECT_DIR/gradlew"
           fi
 
-      - name: Accept Android licenses
+      - name: Install Android SDK packages
         run: |
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== ANDROID SDK PACKAGES =========="
+          } | tee -a "$LOG"
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          # Platform + build-tools umum
+          sdkmanager "platform-tools" "platforms;android-34" "platforms;android-33" "build-tools;34.0.0" "build-tools;33.0.2" 2>&1 | tee -a "$LOG" || true
+
+      - name: Prepare Gradle Wrapper
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== GRADLE WRAPPER =========="
+          } | tee -a "$LOG"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            echo "gradlew sudah ada" | tee -a "$LOG"
+          else
+            echo "gradlew tidak ada — generate wrapper..." | tee -a "$LOG"
+            if ! command -v gradle >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gradle 2>&1 | tee -a "$LOG"
+            fi
+            # Baca distributionUrl dari gradle/wrapper jika ada, else default
+            gradle wrapper --gradle-version 8.7 2>&1 | tee -a "$LOG" || {
+              echo "WARNING: gradle wrapper gagal, akan coba gradle system" | tee -a "$LOG"
+            }
+            if [ -f "./gradlew" ]; then
+              chmod +x ./gradlew
+            fi
+          fi
 
       - name: Gradle build
         id: build
@@ -181,61 +228,92 @@ jobs:
             echo "========== NATIVE GRADLE BUILD ($TYPE) =========="
             echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "PWD: $(pwd)"
+            echo "Java: $(java -version 2>&1 | head -1)"
           } | tee -a "$LOG"
 
-          # Tentukan command gradle
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
             GRADLE="./gradlew"
           else
-            # Install gradle jika belum ada
-            if ! command -v gradle >/dev/null 2>&1; then
-              sudo apt-get update -qq && sudo apt-get install -y -qq gradle 2>>"$LOG" || true
-            fi
             GRADLE="gradle"
           fi
-
           echo "Using: $GRADLE" | tee -a "$LOG"
 
-          # Prefer assemble task
-          if [ "$TYPE" = "debug" ]; then
-            TASK="assembleDebug"
-          else
-            TASK="assembleRelease"
-          fi
-
-          # Jalankan build, simpan full log
+          # List tasks (debug) — jangan gagalkan
           set +e
-          $GRADLE $TASK --stacktrace --info 2>&1 | tee -a "$LOG"
-          BUILD_EXIT=${PIPESTATUS[0]}
+          $GRADLE tasks --all 2>&1 | grep -iE 'assemble|build' | head -40 | tee -a "$LOG"
           set -e
 
-          if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "ERROR: Gradle build gagal (exit $BUILD_EXIT)." | tee -a "$LOG"
-            # Fallback: coba assemble tanpa variant
-            if [ "$TYPE" = "release" ]; then
-              echo "Mencoba fallback assembleDebug..." | tee -a "$LOG"
-              set +e
-              $GRADLE assembleDebug --stacktrace 2>&1 | tee -a "$LOG"
-              BUILD_EXIT=${PIPESTATUS[0]}
-              set -e
+          # Pilih task
+          if [ "$TYPE" = "debug" ]; then
+            TASKS="assembleDebug"
+          else
+            # release sering butuh signing → coba release dulu, fallback debug
+            TASKS="assembleRelease"
+          fi
+
+          run_build() {
+            local task="$1"
+            echo "" | tee -a "$LOG"
+            echo ">>> Running: $GRADLE $task --stacktrace --no-daemon" | tee -a "$LOG"
+            set +e
+            $GRADLE "$task" --stacktrace --no-daemon 2>&1 | tee -a "$LOG"
+            local ec=${PIPESTATUS[0]}
+            set -e
+            return $ec
+          }
+
+          BUILD_EXIT=1
+          if run_build "$TASKS"; then
+            BUILD_EXIT=0
+          else
+            BUILD_EXIT=$?
+            echo "ERROR: Task $TASKS gagal (exit $BUILD_EXIT)." | tee -a "$LOG"
+
+            # Fallback 1: assembleDebug
+            if [ "$TASKS" != "assembleDebug" ]; then
+              echo "Fallback → assembleDebug ..." | tee -a "$LOG"
+              if run_build "assembleDebug"; then
+                BUILD_EXIT=0
+              else
+                BUILD_EXIT=$?
+              fi
+            fi
+
+            # Fallback 2: assemble (generic)
+            if [ "$BUILD_EXIT" -ne 0 ]; then
+              echo "Fallback → assemble ..." | tee -a "$LOG"
+              if run_build "assemble"; then
+                BUILD_EXIT=0
+              else
+                BUILD_EXIT=$?
+              fi
             fi
           fi
 
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "ERROR: Build Android Native gagal." | tee -a "$LOG"
+            {
+              echo ""
+              echo "========== GRADLE FAILURE SUMMARY =========="
+              echo "Exit code: $BUILD_EXIT"
+              echo "--- grep error/FAILURE dari log ---"
+              grep -iE 'error:|FAILURE:|What went wrong|Could not|not found|FAILED' "$LOG" | tail -40 || true
+              echo "--- isi settings/build.gradle (head) ---"
+              head -40 settings.gradle settings.gradle.kts 2>/dev/null || true
+              head -40 build.gradle build.gradle.kts 2>/dev/null || true
+              echo "ERROR: Build Android Native gagal."
+            } | tee -a "$LOG"
             exit 1
           fi
 
           # Cari APK
           APK_SRC=$(find . -type f -path "*/outputs/apk/*/*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_SRC" ]; then
-            APK_SRC=$(find . -type f -name "*.apk" 2>/dev/null | head -n 1)
+            APK_SRC=$(find . -type f -name "*.apk" ! -path "*/.gradle/*" 2>/dev/null | head -n 1)
           fi
 
           if [ -z "$APK_SRC" ] || [ ! -f "$APK_SRC" ]; then
             echo "ERROR: APK tidak ditemukan setelah build." | tee -a "$LOG"
-            echo "File .apk di project:" | tee -a "$LOG"
             find . -type f -name "*.apk" 2>/dev/null | tee -a "$LOG" || true
             find . -type d -name "outputs" 2>/dev/null | head -20 | tee -a "$LOG" || true
             exit 1
@@ -244,7 +322,6 @@ jobs:
           OUT_NAME="app-${TYPE}-${{ inputs.tag }}.apk"
           cp "$APK_SRC" "$GITHUB_WORKSPACE/out/$OUT_NAME"
           ls -lh "$GITHUB_WORKSPACE/out/$OUT_NAME" | tee -a "$LOG"
-          echo "APK_PATH=$GITHUB_WORKSPACE/out/$OUT_NAME" >> "$GITHUB_ENV"
           echo "Build sukses: $OUT_NAME" | tee -a "$LOG"
 
       - name: Write success log
@@ -273,8 +350,8 @@ jobs:
             echo "BUILD_TYPE: ${{ inputs.build_type }}"
             echo "FAILED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
-            echo "--- last 100 lines of log ---"
-            tail -100 "$LOG" || true
+            echo "--- last 120 lines of log ---"
+            tail -120 "$LOG" || true
           } | tee -a "$LOG"
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp "$LOG" "$GITHUB_WORKSPACE/out/build_error_${{ inputs.tag }}.log"
