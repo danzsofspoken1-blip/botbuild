@@ -1,127 +1,255 @@
-name: Build Native APK (Server 2)
+name: Build Native Android APK
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
     inputs:
+      zip_url:
+        description: "URL download ZIP project Android Native"
+        required: true
+        type: string
+      tag:
+        description: "Tag build (unik per user/job)"
+        required: true
+        type: string
       build_type:
-        description: 'Build type'
+        description: "debug atau release"
         required: true
-        default: 'release'
-        type: choice
-        options:
-          - release
-          - debug
-      flutter_arch:
-        description: 'Flutter architecture'
-        required: true
-        default: 'arm64-v8a'
-        type: choice
-        options:
-          - arm64-v8a
-          - armeabi-v7a
-          - x86_64
-          - all
+        type: string
+        default: "release"
+
+env:
+  TAG: ${{ inputs.tag }}
+  BUILD_TYPE: ${{ inputs.build_type }}
+  ZIP_URL: ${{ inputs.zip_url }}
 
 jobs:
-  build-native:
+  build:
+    name: Native Build (${{ inputs.build_type }})
     runs-on: ubuntu-latest
-    
-    outputs:
-      apk_path: ${{ steps.set-output.outputs.apk_path }}
+    timeout-minutes: 45
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      - name: Create workdir
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/project" "$GITHUB_WORKSPACE/out" "$GITHUB_WORKSPACE/logs"
+          echo "TAG=${{ inputs.tag }}" > "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "BUILD_TYPE=${{ inputs.build_type }}" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "PLATFORM=native" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
 
-    - name: Accept Android SDK licenses
-      run: |
-        yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses
+      - name: Download project ZIP
+        id: download
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo "========== DOWNLOAD ZIP =========="
+            echo "URL: ${{ inputs.zip_url }}"
+            echo "TAG: ${{ inputs.tag }}"
+            echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+          } | tee -a "$LOG"
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x apk_korban/gradlew
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -o "$GITHUB_WORKSPACE/project.zip" \
+            "${{ inputs.zip_url }}" 2>>"$LOG" || {
+            echo "ERROR: Gagal download ZIP dari URL yang diberikan." | tee -a "$LOG"
+            exit 1
+          }
 
-    - name: Build Native APK (Release)
-      if: github.event.inputs.build_type == 'release' || github.event_name == 'push' || github.event_name == 'pull_request'
-      run: |
-        cd apk_korban
-        ./gradlew assembleRelease
+          FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/project.zip" 2>/dev/null || echo 0)
+          echo "Downloaded size: ${FILE_SIZE} bytes" | tee -a "$LOG"
 
-    - name: Build Native APK (Debug)
-      if: github.event.inputs.build_type == 'debug'
-      run: |
-        cd apk_korban
-        ./gradlew assembleDebug
+          if [ "$FILE_SIZE" -lt 100 ]; then
+            echo "ERROR: File ZIP kosong atau terlalu kecil." | tee -a "$LOG"
+            exit 1
+          fi
 
-    - name: Set output path
-      id: set-output
-      run: |
-        if [ "${{ github.event.inputs.build_type }}" == "debug" ]; then
-          echo "apk_path=apk_korban/app/build/outputs/apk/debug/app-debug.apk" >> $GITHUB_OUTPUT
-        else
-          echo "apk_path=apk_korban/app/build/outputs/apk/release/app-release.apk" >> $GITHUB_OUTPUT
-        fi
+      - name: Extract & locate Android project
+        id: extract
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== EXTRACT ZIP =========="
+          } | tee -a "$LOG"
 
-    - name: Upload Native APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: native-apk-${{ github.event.inputs.build_type || 'release' }}
-        path: ${{ steps.set-output.outputs.apk_path }}
+          unzip -q -o "$GITHUB_WORKSPACE/project.zip" -d "$GITHUB_WORKSPACE/project" 2>>"$LOG" || {
+            echo "ERROR: Gagal extract ZIP. Pastikan file valid (.zip)." | tee -a "$LOG"
+            exit 1
+          }
 
-    - name: Upload Native APK (Debug)
-      if: github.event.inputs.build_type == 'debug'
-      uses: actions/upload-artifact@v4
-      with:
-        name: native-apk-debug
-        path: apk_korban/app/build/outputs/apk/debug/app-debug.apk
+          # Cari settings.gradle / settings.gradle.kts / build.gradle (root)
+          SETTINGS=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n 1)
+          ROOT_GRADLE=""
 
-    - name: Upload Native APK (Release)
-      if: github.event.inputs.build_type == 'release' || github.event_name == 'push' || github.event_name == 'pull_request'
-      uses: actions/upload-artifact@v4
-      with:
-        name: native-apk-release
-        path: apk_korban/app/build/outputs/apk/release/app-release.apk
+          if [ -n "$SETTINGS" ]; then
+            PROJECT_DIR=$(dirname "$SETTINGS")
+          else
+            ROOT_GRADLE=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) | head -n 1)
+            if [ -z "$ROOT_GRADLE" ]; then
+              echo "ERROR: settings.gradle / build.gradle tidak ditemukan di dalam ZIP." | tee -a "$LOG"
+              echo "Struktur folder setelah extract:" | tee -a "$LOG"
+              find "$GITHUB_WORKSPACE/project" -maxdepth 3 -type d 2>/dev/null | head -50 | tee -a "$LOG"
+              find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) 2>/dev/null | head -20 | tee -a "$LOG"
+              exit 1
+            fi
+            PROJECT_DIR=$(dirname "$ROOT_GRADLE")
+          fi
 
-  # ─── UPLOAD TO RELEASE ────────────────────────────────────
-  upload-release:
-    needs: build-native
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    
-    steps:
-    - name: Download Native APK
-      uses: actions/download-artifact@v4
-      with:
-        name: native-apk-${{ github.event.inputs.build_type || 'release' }}
-        path: ./apk
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_DIR" | tee -a "$LOG"
+          ls -la "$PROJECT_DIR" | tee -a "$LOG"
 
-    - name: Create Release
-      id: create_release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: native-build-${{ github.run_number }}
-        name: Native Build ${{ github.run_number }}
-        draft: false
-        prerelease: true
-        generate_release_notes: true
-        files: |
-          ./apk/*.apk
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pastikan ada gradlew atau generate wrapper
+          if [ ! -f "$PROJECT_DIR/gradlew" ]; then
+            echo "gradlew tidak ada, akan coba pakai gradle system / generate wrapper" | tee -a "$LOG"
+          else
+            chmod +x "$PROJECT_DIR/gradlew"
+          fi
 
-    - name: Output Release URL
-      run: |
-        echo "Release URL: ${{ steps.create_release.outputs.url }}"
-        echo "Upload URL: ${{ steps.create_release.outputs.upload_url }}"
+      - name: Accept Android licenses
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Gradle build
+        id: build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          TYPE="${{ inputs.build_type }}"
+          {
+            echo ""
+            echo "========== NATIVE GRADLE BUILD ($TYPE) =========="
+            echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "PWD: $(pwd)"
+          } | tee -a "$LOG"
+
+          # Tentukan command gradle
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            GRADLE="./gradlew"
+          else
+            # Install gradle jika belum ada
+            if ! command -v gradle >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq gradle 2>>"$LOG" || true
+            fi
+            GRADLE="gradle"
+          fi
+
+          echo "Using: $GRADLE" | tee -a "$LOG"
+
+          # Prefer assemble task
+          if [ "$TYPE" = "debug" ]; then
+            TASK="assembleDebug"
+          else
+            TASK="assembleRelease"
+          fi
+
+          # Jalankan build, simpan full log
+          set +e
+          $GRADLE $TASK --stacktrace --info 2>&1 | tee -a "$LOG"
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo "ERROR: Gradle build gagal (exit $BUILD_EXIT)." | tee -a "$LOG"
+            # Fallback: coba assemble tanpa variant
+            if [ "$TYPE" = "release" ]; then
+              echo "Mencoba fallback assembleDebug..." | tee -a "$LOG"
+              set +e
+              $GRADLE assembleDebug --stacktrace 2>&1 | tee -a "$LOG"
+              BUILD_EXIT=${PIPESTATUS[0]}
+              set -e
+            fi
+          fi
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo "ERROR: Build Android Native gagal." | tee -a "$LOG"
+            exit 1
+          fi
+
+          # Cari APK
+          APK_SRC=$(find . -type f -path "*/outputs/apk/*/*.apk" 2>/dev/null | head -n 1)
+          if [ -z "$APK_SRC" ]; then
+            APK_SRC=$(find . -type f -name "*.apk" 2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$APK_SRC" ] || [ ! -f "$APK_SRC" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build." | tee -a "$LOG"
+            echo "File .apk di project:" | tee -a "$LOG"
+            find . -type f -name "*.apk" 2>/dev/null | tee -a "$LOG" || true
+            find . -type d -name "outputs" 2>/dev/null | head -20 | tee -a "$LOG" || true
+            exit 1
+          fi
+
+          OUT_NAME="app-${TYPE}-${{ inputs.tag }}.apk"
+          cp "$APK_SRC" "$GITHUB_WORKSPACE/out/$OUT_NAME"
+          ls -lh "$GITHUB_WORKSPACE/out/$OUT_NAME" | tee -a "$LOG"
+          echo "APK_PATH=$GITHUB_WORKSPACE/out/$OUT_NAME" >> "$GITHUB_ENV"
+          echo "Build sukses: $OUT_NAME" | tee -a "$LOG"
+
+      - name: Write success log
+        if: success()
+        run: |
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== BUILD SUCCESS =========="
+            echo "TAG: ${{ inputs.tag }}"
+            echo "PLATFORM: native"
+            echo "BUILD_TYPE: ${{ inputs.build_type }}"
+            echo "FINISHED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$LOG"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_log_${{ inputs.tag }}.txt"
+
+      - name: Capture failure log
+        if: failure()
+        run: |
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== BUILD FAILED =========="
+            echo "TAG: ${{ inputs.tag }}"
+            echo "PLATFORM: native"
+            echo "BUILD_TYPE: ${{ inputs.build_type }}"
+            echo "FAILED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "--- last 100 lines of log ---"
+            tail -100 "$LOG" || true
+          } | tee -a "$LOG"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_error_${{ inputs.tag }}.log"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_log_${{ inputs.tag }}.txt"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: ${{ github.workspace }}/out/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ inputs.tag }}
+          path: |
+            ${{ github.workspace }}/out/build_log_*.txt
+            ${{ github.workspace }}/out/build_error_*.log
+            ${{ github.workspace }}/logs/build_error.log
+          if-no-files-found: ignore
+          retention-days: 7
