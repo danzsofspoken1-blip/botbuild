@@ -51,25 +51,72 @@ jobs:
 
       - name: Download project ZIP
         id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          ZIP_OUT="$GITHUB_WORKSPACE/project.zip"
+          URL="${{ inputs.zip_url }}"
           {
             echo "========== DOWNLOAD ZIP =========="
-            echo "URL: ${{ inputs.zip_url }}"
+            echo "URL: $URL"
             echo "TAG: ${{ inputs.tag }}"
             echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
           } | tee -a "$LOG"
 
-          curl -L --fail --retry 3 --retry-delay 2 \
-            -o "$GITHUB_WORKSPACE/project.zip" \
-            "${{ inputs.zip_url }}" 2>>"$LOG" || {
-            echo "ERROR: Gagal download ZIP dari URL yang diberikan." | tee -a "$LOG"
-            exit 1
-          }
+          download_ok=0
 
-          FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/project.zip" 2>/dev/null || echo 0)
+          for i in 1 2 3 4; do
+            echo "Download attempt $i (public)..." | tee -a "$LOG"
+            if curl -L --fail --retry 2 --retry-delay 2 \
+              -A "FlutterBuildBot/1.0" \
+              -o "$ZIP_OUT" \
+              "$URL" 2>>"$LOG"; then
+              download_ok=1
+              break
+            fi
+            echo "Attempt $i failed, sleep 3s..." | tee -a "$LOG"
+            sleep 3
+          done
+
+          if [ "$download_ok" -ne 1 ]; then
+            echo "Public download gagal. Coba via GitHub API + GITHUB_TOKEN..." | tee -a "$LOG"
+            if echo "$URL" | grep -qE 'github.com/.+/releases/download/'; then
+              OWNER_REPO=$(echo "$URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+              TAG_PART=$(echo "$URL" | sed -E 's|https://github.com/[^/]+/[^/]+/releases/download/([^/]+)/.*|\1|')
+              FILE_PART=$(echo "$URL" | sed -E 's|https://github.com/[^/]+/[^/]+/releases/download/[^/]+/(.*)|\1|')
+              TAG_DEC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$TAG_PART")
+              FILE_DEC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$FILE_PART")
+              echo "owner/repo=$OWNER_REPO tag=$TAG_DEC file=$FILE_DEC" | tee -a "$LOG"
+              printf '%s' "$FILE_DEC" > /tmp/want_name.txt
+              API="https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG_DEC}"
+              curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" -o /tmp/rel.json 2>>"$LOG" || true
+              ASSET_ID=$(python3 -c "import json; d=json.load(open('/tmp/rel.json')); want=open('/tmp/want_name.txt').read().strip(); assets=d.get('assets') or []; m=next((a for a in assets if a.get('name')==want), None) or next((a for a in assets if str(a.get('name','')).lower().endswith('.zip')), None); print(m['id'] if m else '')")
+              if [ -n "$ASSET_ID" ]; then
+                echo "Found asset id: $ASSET_ID" | tee -a "$LOG"
+                if curl -L --fail \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" \
+                  -o "$ZIP_OUT" \
+                  "https://api.github.com/repos/${OWNER_REPO}/releases/assets/${ASSET_ID}" 2>>"$LOG"; then
+                  download_ok=1
+                fi
+              else
+                echo "Asset id tidak ditemukan di release tag $TAG_DEC" | tee -a "$LOG"
+                head -c 800 /tmp/rel.json | tee -a "$LOG" || true
+              fi
+            fi
+          fi
+
+          if [ "$download_ok" -ne 1 ]; then
+            echo "ERROR: Gagal download ZIP dari URL yang diberikan (404/unauthorized)." | tee -a "$LOG"
+            echo "Pastikan bot sudah publish release (bukan draft/untagged) sebelum trigger workflow." | tee -a "$LOG"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$ZIP_OUT" 2>/dev/null || echo 0)
           echo "Downloaded size: ${FILE_SIZE} bytes" | tee -a "$LOG"
 
           if [ "$FILE_SIZE" -lt 100 ]; then
