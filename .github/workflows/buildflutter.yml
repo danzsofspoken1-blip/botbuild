@@ -6,286 +6,223 @@ on:
       zip_url:
         description: "URL download ZIP project Flutter"
         required: true
-
+        type: string
       tag:
-        description: "Tag build"
+        description: "Tag build (unik per user/job)"
         required: true
-
+        type: string
       build_type:
-        description: "debug / release"
+        description: "debug atau release"
         required: true
+        type: string
         default: "release"
-        
-      only_analyze:
-        description: "Hanya jalankan analyze (true/false)"
-        required: false
-        default: "false"
+
+env:
+  TAG: ${{ inputs.tag }}
+  BUILD_TYPE: ${{ inputs.build_type }}
+  ZIP_URL: ${{ inputs.zip_url }}
 
 jobs:
   build:
+    name: Flutter Build (${{ inputs.build_type }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    
+    timeout-minutes: 45
+
     steps:
-
-      # =========================
-      # NODE.JS
-      # =========================
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      # =========================
-      # DOWNLOAD ZIP
-      # =========================
-      - name: Download ZIP project
-        run: |
-          echo "=== Downloading ZIP ==="
-          echo "URL: ${{ github.event.inputs.zip_url }}"
-
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip \
-            -w "\n=== HTTP Status: %{http_code} ===\n=== Final URL: %{url_effective} ===\n"
-
-          echo ""
-          echo "=== File Info ==="
-          ls -lh project.zip
-
-          echo ""
-          echo "=== File Type ==="
-          file project.zip
-
-          echo ""
-          echo "=== First Bytes ==="
-          xxd project.zip | head -2
-
-      # =========================
-      # EXTRACT ZIP
-      # =========================
-      - name: Extract ZIP
-        run: |
-          echo "=== Validating ZIP ==="
-
-          if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "❌ File bukan ZIP valid!"
-            echo ""
-            echo "=== Isi file ==="
-            cat project.zip
-            exit 1
-          fi
-
-          echo "✅ ZIP valid"
-
-          echo ""
-          echo "=== Extracting ZIP ==="
-          unzip -q project.zip -d project_raw
-
-          echo ""
-          echo "=== Isi folder project_raw ==="
-          find project_raw | head -50
-
-          echo ""
-          echo "=== Mengunci Project Dir (Manut Mode) ==="
-          
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
-            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          else
-            PROJECT_DIR="project_raw"
-          fi
-
-          echo "✅ Project root langsung dikunci di: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-
-      # =========================
-      # JAVA
-      # =========================
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
-      # =========================
-      # FLUTTER
-      # =========================
       - name: Setup Flutter
-        uses: subosito/flutter-action@main
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.41.9"
           channel: "stable"
           cache: true
 
-      # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
-      # ==========================================================
-      - name: Analyze Project Code
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Create workdir
         run: |
-          echo "=== Starting Automated Code Analysis ==="
+          mkdir -p "$GITHUB_WORKSPACE/project" "$GITHUB_WORKSPACE/out" "$GITHUB_WORKSPACE/logs"
+          echo "TAG=${{ inputs.tag }}" > "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "BUILD_TYPE=${{ inputs.build_type }}" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "PLATFORM=flutter" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/logs/build_meta.txt"
 
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔍 Menjalankan linting via flutter analyze..."
+      - name: Download project ZIP
+        id: download
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo "========== DOWNLOAD ZIP =========="
+            echo "URL: ${{ inputs.zip_url }}"
+            echo "TAG: ${{ inputs.tag }}"
+            echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+          } | tee -a "$LOG"
 
-            flutter analyze > analyze_report.txt 2>&1 || true
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -o "$GITHUB_WORKSPACE/project.zip" \
+            "${{ inputs.zip_url }}" 2>>"$LOG" || {
+            echo "ERROR: Gagal download ZIP dari URL yang diberikan." | tee -a "$LOG"
+            exit 1
+          }
 
-            echo "[RESULT_ANALYZE]"
-            cat analyze_report.txt
-            echo "[END_RESULT_ANALYZE]"
+          FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/project.zip" 2>/dev/null || echo 0)
+          echo "Downloaded size: ${FILE_SIZE} bytes" | tee -a "$LOG"
 
-            rm -f analyze_report.txt
-
-          else
-            echo "☕ Project native / gradlew terdeteksi!"
-            echo "[RESULT_ANALYZE]"
-            echo "❌ Fitur analyze hanya support project Flutter (pubspec.yaml tidak ditemukan)."
-            echo "[END_RESULT_ANALYZE]"
+          if [ "$FILE_SIZE" -lt 100 ]; then
+            echo "ERROR: File ZIP kosong atau terlalu kecil." | tee -a "$LOG"
+            exit 1
           fi
 
-      # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
-      # ==========================================================
-      - name: Stop if Analyze Only
-        if: ${{ github.event.inputs.only_analyze == 'true' }}
+      - name: Extract & locate Flutter project
+        id: extract
         run: |
-          echo "Analyze-only mode aktif. Workflow dihentikan di sini."
-          exit 1
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== EXTRACT ZIP =========="
+          } | tee -a "$LOG"
 
-      # =========================
-      # FLUTTER DOCTOR
-      # =========================
-      - name: Flutter Doctor
-        run: flutter doctor
+          unzip -q -o "$GITHUB_WORKSPACE/project.zip" -d "$GITHUB_WORKSPACE/project" 2>>"$LOG" || {
+            echo "ERROR: Gagal extract ZIP. Pastikan file valid (.zip)." | tee -a "$LOG"
+            exit 1
+          }
 
-      # ==========================================================
-      # 📦 TAHAP DOWNLOAD DEPENDENSI (PUB GET)
-      # ==========================================================
-      - name: Get dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          echo "=== Running flutter pub get ==="
-          if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || echo "⚠️ Gagal download package karena network server, coba lanjut aja..."
-          else
-            echo "☕ Bukan project Flutter standar, skip pub get!"
+          # Cari pubspec.yaml (bisa nested 1-2 level)
+          PUBSPEC=$(find "$GITHUB_WORKSPACE/project" -maxdepth 4 -type f -name "pubspec.yaml" | head -n 1)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan di dalam ZIP." | tee -a "$LOG"
+            echo "Struktur folder setelah extract:" | tee -a "$LOG"
+            find "$GITHUB_WORKSPACE/project" -maxdepth 3 -type d 2>/dev/null | head -50 | tee -a "$LOG"
+            exit 1
           fi
 
-      # ==========================================================
-      # 🚀 TAHAP PEMBAKARAN UTAMA (BUILD APK)
-      # ==========================================================
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Found pubspec.yaml at: $PUBSPEC" | tee -a "$LOG"
+          echo "Project root: $PROJECT_DIR" | tee -a "$LOG"
+
+          # Info ringkas
+          if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            echo "--- pubspec.yaml (head) ---" | tee -a "$LOG"
+            head -30 "$PROJECT_DIR/pubspec.yaml" | tee -a "$LOG"
+          fi
+
+      - name: Flutter doctor
+        run: |
+          flutter --version
+          flutter doctor -v || true
+
+      - name: Flutter pub get
+        id: pubget
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== FLUTTER PUB GET =========="
+          } | tee -a "$LOG"
+
+          flutter pub get 2>&1 | tee -a "$LOG"
+          echo "pub get OK" | tee -a "$LOG"
+
       - name: Build APK
+        id: build
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          echo "=== Building APK ==="
-          echo "Mode: ${{ github.event.inputs.build_type }}"
+          set -e
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          TYPE="${{ inputs.build_type }}"
+          {
+            echo ""
+            echo "========== FLUTTER BUILD ($TYPE) =========="
+            echo "TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$LOG"
 
-          BUILD_FAILED=0
-
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔥 Project Flutter Terdeteksi! Kompilasi via Flutter SDK..."
-
-            if ! flutter build apk --${{ github.event.inputs.build_type }} 2>&1 | tee build_report.txt; then
-              BUILD_FAILED=1
-            fi
-
+          if [ "$TYPE" = "debug" ]; then
+            flutter build apk --debug 2>&1 | tee -a "$LOG"
+            APK_SRC=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -n 1)
           else
-            echo "☕ Project Native Android Terdeteksi! Bypassing Flutter Core..."
-            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
-
-            if [ -z "$GRADLE_PATH" ]; then
-              echo "❌ ERROR: File 'gradlew' tidak ditemukan!"
-              echo "[RESULT_BUILD_ERROR]"
-              echo "Gagal menemukan file gradlew di dalam project. Pastikan ini project Android/Flutter yang valid."
-              echo "[END_RESULT_BUILD_ERROR]"
-              exit 1
+            flutter build apk --release 2>&1 | tee -a "$LOG"
+            APK_SRC=$(find build/app/outputs -type f -name "*release*.apk" 2>/dev/null | head -n 1)
+            if [ -z "$APK_SRC" ]; then
+              APK_SRC=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -n 1)
             fi
-
-            GRADLE_DIR=$(dirname "$GRADLE_PATH")
-            cd "$GRADLE_DIR"
-            chmod +x gradlew
-
-            echo "🚀 Membakar APK menggunakan Gradle Native..."
-            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              GRADLE_TASK="assembleDebug"
-            else
-              GRADLE_TASK="assembleRelease"
-            fi
-
-            if ! ./gradlew "$GRADLE_TASK" 2>&1 | tee build_report.txt; then
-              BUILD_FAILED=1
-            fi
-
-            mv build_report.txt "$OLDPWD/build_report.txt" 2>/dev/null || true
-            cd -
           fi
 
-          if [ "$BUILD_FAILED" -eq 1 ]; then
-            echo ""
-            echo "❌ BUILD GAGAL! Berikut ringkasan error-nya:"
-            echo ""
-            echo "[RESULT_BUILD_ERROR]"
-            # Ambil bagian paling relevan: baris yang mengandung kata kunci error,
-            # kalau tidak ketemu, tampilkan 80 baris terakhir log build.
-            if grep -Ei "error|exception|failure|failed" build_report.txt > /dev/null 2>&1; then
-              grep -Ei -B2 -A5 "error|exception|failure|failed" build_report.txt
-            else
-              tail -n 80 build_report.txt
-            fi
-            echo "[END_RESULT_BUILD_ERROR]"
-            echo ""
-            echo "📄 Log build lengkap ada di file 'build_report.txt' (working directory project)."
-            rm -f build_report.txt
+          if [ -z "$APK_SRC" ] || [ ! -f "$APK_SRC" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build." | tee -a "$LOG"
+            echo "Isi build/app/outputs (jika ada):" | tee -a "$LOG"
+            find build -type f -name "*.apk" 2>/dev/null | tee -a "$LOG" || true
+            find build/app/outputs -type f 2>/dev/null | head -40 | tee -a "$LOG" || true
             exit 1
           fi
 
-          echo "✅ Build APK selesai tanpa error."
-          rm -f build_report.txt
+          OUT_NAME="app-${TYPE}-${{ inputs.tag }}.apk"
+          cp "$APK_SRC" "$GITHUB_WORKSPACE/out/$OUT_NAME"
+          ls -lh "$GITHUB_WORKSPACE/out/$OUT_NAME" | tee -a "$LOG"
+          echo "APK_PATH=$GITHUB_WORKSPACE/out/$OUT_NAME" >> "$GITHUB_ENV"
+          echo "Build sukses: $OUT_NAME" | tee -a "$LOG"
 
-      # =========================
-      # CHECK APK
-      # =========================
-      - name: Check APK Output
+      - name: Write success log
+        if: success()
         run: |
-          echo "=== APK Output Scanning (Global Mode) ==="
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== BUILD SUCCESS =========="
+            echo "TAG: ${{ inputs.tag }}"
+            echo "PLATFORM: flutter"
+            echo "BUILD_TYPE: ${{ inputs.build_type }}"
+            echo "FINISHED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$LOG"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_log_${{ inputs.tag }}.txt"
 
-          echo "Mencari file APK di seluruh direktori..."
-          find $GITHUB_WORKSPACE -name "*.apk"
+      - name: Capture failure log
+        if: failure()
+        run: |
+          LOG="$GITHUB_WORKSPACE/logs/build_error.log"
+          {
+            echo ""
+            echo "========== BUILD FAILED =========="
+            echo "TAG: ${{ inputs.tag }}"
+            echo "PLATFORM: flutter"
+            echo "BUILD_TYPE: ${{ inputs.build_type }}"
+            echo "FAILED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "--- flutter doctor (debug) ---"
+            flutter doctor -v || true
+            echo ""
+            echo "--- last 80 lines of log ---"
+            tail -80 "$LOG" || true
+          } | tee -a "$LOG"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_error_${{ inputs.tag }}.log"
+          cp "$LOG" "$GITHUB_WORKSPACE/out/build_log_${{ inputs.tag }}.txt"
 
-          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
-
-          if [ -z "$APK_FOUND" ]; then
-            echo "Error: Berkas biner APK beneran gak dicetak sama sekali oleh compiler."
-            exit 1
-          fi
-
-          APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
-
-          echo "✅ APK Sukses Ditemukan di Jalur: $APK_PATH"
-          
-          echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
-
-          echo ""
-          echo "=== APK Size ==="
-          ls -lh "$APK_FOUND"
-
-      # =========================
-      # UPLOAD APK
-      # =========================
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
-          retention-days: 1
+          name: apk-${{ inputs.tag }}
+          path: ${{ github.workspace }}/out/*.apk
           if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ inputs.tag }}
+          path: |
+            ${{ github.workspace }}/out/build_log_*.txt
+            ${{ github.workspace }}/out/build_error_*.log
+            ${{ github.workspace }}/logs/build_error.log
+          if-no-files-found: ignore
+          retention-days: 7
