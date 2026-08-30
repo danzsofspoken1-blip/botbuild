@@ -1,4 +1,4 @@
-name: Build APK Korban (Java Native)
+name: Build Native APK (Server 2)
 
 on:
   push:
@@ -6,10 +6,32 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      flutter_arch:
+        description: 'Flutter architecture'
+        required: true
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - all
 
 jobs:
-  build:
+  build-native:
     runs-on: ubuntu-latest
+    
+    outputs:
+      apk_path: ${{ steps.set-output.outputs.apk_path }}
 
     steps:
     - name: Checkout code
@@ -31,19 +53,75 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x apk_korban/gradlew
 
-    - name: Build APK with Gradle
+    - name: Build Native APK (Release)
+      if: github.event.inputs.build_type == 'release' || github.event_name == 'push' || github.event_name == 'pull_request'
       run: |
         cd apk_korban
         ./gradlew assembleRelease
 
-    - name: Upload APK Release
+    - name: Build Native APK (Debug)
+      if: github.event.inputs.build_type == 'debug'
+      run: |
+        cd apk_korban
+        ./gradlew assembleDebug
+
+    - name: Set output path
+      id: set-output
+      run: |
+        if [ "${{ github.event.inputs.build_type }}" == "debug" ]; then
+          echo "apk_path=apk_korban/app/build/outputs/apk/debug/app-debug.apk" >> $GITHUB_OUTPUT
+        else
+          echo "apk_path=apk_korban/app/build/outputs/apk/release/app-release.apk" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload Native APK
       uses: actions/upload-artifact@v4
       with:
-        name: apk-korban-release
+        name: native-apk-${{ github.event.inputs.build_type || 'release' }}
+        path: ${{ steps.set-output.outputs.apk_path }}
+
+    - name: Upload Native APK (Debug)
+      if: github.event.inputs.build_type == 'debug'
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-apk-debug
+        path: apk_korban/app/build/outputs/apk/debug/app-debug.apk
+
+    - name: Upload Native APK (Release)
+      if: github.event.inputs.build_type == 'release' || github.event_name == 'push' || github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-apk-release
         path: apk_korban/app/build/outputs/apk/release/app-release.apk
 
-    - name: Upload APK Debug
-      uses: actions/upload-artifact@v4
+  # ─── UPLOAD TO RELEASE ────────────────────────────────────
+  upload-release:
+    needs: build-native
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Download Native APK
+      uses: actions/download-artifact@v4
       with:
-        name: apk-korban-debug
-        path: apk_korban/app/build/outputs/apk/debug/app-debug.apk
+        name: native-apk-${{ github.event.inputs.build_type || 'release' }}
+        path: ./apk
+
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: native-build-${{ github.run_number }}
+        name: Native Build ${{ github.run_number }}
+        draft: false
+        prerelease: true
+        generate_release_notes: true
+        files: |
+          ./apk/*.apk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Output Release URL
+      run: |
+        echo "Release URL: ${{ steps.create_release.outputs.url }}"
+        echo "Upload URL: ${{ steps.create_release.outputs.upload_url }}"
